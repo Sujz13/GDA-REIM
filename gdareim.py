@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from recbole.model.abstract_recommender import SequentialRecommender
 from einops import rearrange
 import math
+import ipdb
 
 def gelu(x):
     return (
@@ -46,19 +47,13 @@ class GDAREIM(SequentialRecommender):
         )
         self.n_facet_MLP = config["n_facet_MLP"]
         self.n_facet_context = config["n_facet_context"]
-        self.n_facet_reranker = config[
-            "n_facet_reranker"
-        ]
+
         self.n_facet_emb = config["n_facet_emb"]
         self.weight_mode = config["weight_mode"]
         self.context_norm = config["context_norm"]
         self.post_remove_context = config["post_remove_context"]
         self.partition_merging_mode = config["partition_merging_mode"]
-        self.reranker_merging_mode = config["reranker_merging_mode"]
-        self.reranker_CAN_NUM = [
-            int(x) for x in str(config["reranker_CAN_NUM"]).split(",")
-        ]
-        self.candidates_from_previous_reranker = True
+
         if self.weight_mode == "max_logits":
             self.n_facet_effective = 1
         else:
@@ -67,7 +62,6 @@ class GDAREIM(SequentialRecommender):
         assert (
             self.n_facet
             + self.n_facet_context
-            + self.n_facet_reranker * len(self.reranker_CAN_NUM)
             + self.n_facet_emb
             == self.n_facet_all
         )
@@ -188,27 +182,7 @@ class GDAREIM(SequentialRecommender):
                 ]
                 device = hidden_states.device
                 hidden_emb_arr.append(hidden_states)
-                for j in range(self.n_facet_window):
-                    (
-                        bsz,
-                        seq_len,
-                        hidden_size,
-                    ) = (
-                        hidden_states.size()
-                    )
-                    if j + 1 < hidden_states.size(1):
-                        shifted_hidden = torch.cat(
-                            (
-                                torch.zeros((bsz, (j + 1), hidden_size), device=device),
-                                hidden_states[:, : -(j + 1), :],
-                            ),
-                            dim=1,
-                        )
-                    else:
-                        shifted_hidden = torch.zeros(
-                            (bsz, hidden_states.size(1), hidden_size), device=device
-                        )
-                    hidden_emb_arr.append(shifted_hidden)
+                
 
             if self.n_facet_MLP > 0:
                 stacked_hidden_emb_raw_arr = torch.cat(
@@ -228,7 +202,6 @@ class GDAREIM(SequentialRecommender):
             facet_lm_logits_arr = []
             facet_lm_logits_real_arr = []
 
-            rereanker_candidate_token_ids_arr = []
             for i in range(self.n_facet):
                 projected_emb = self.get_facet_emb(
                     stacked_hidden_emb_arr, i
@@ -236,31 +209,12 @@ class GDAREIM(SequentialRecommender):
                 projected_emb_arr.append(projected_emb)
                 lm_logits = F.linear(projected_emb, self.item_embedding.weight, None)
                 facet_lm_logits_arr.append(lm_logits)
-                if (
-                    i < self.n_facet_reranker
-                    and not self.candidates_from_previous_reranker
-                ):
-                    candidate_token_ids = []
-                    for j in range(len(self.reranker_CAN_NUM)):
-                        _, candidate_token_ids_ = torch.topk(
-                            lm_logits, self.reranker_CAN_NUM[j]
-                        )
-                        candidate_token_ids.append(candidate_token_ids_)
-                    rereanker_candidate_token_ids_arr.append(candidate_token_ids)
 
-            for i in range(self.n_facet_reranker):
-                for j in range(len(self.reranker_CAN_NUM)):
-                    projected_emb = self.get_facet_emb(
-                        stacked_hidden_emb_arr,
-                        self.n_facet + i * len(self.reranker_CAN_NUM) + j,
-                    )
-                    projected_emb_arr.append(projected_emb)
 
             for i in range(self.n_facet_context):
                 projected_emb = self.get_facet_emb(
                     stacked_hidden_emb_arr,
                     self.n_facet
-                    + self.n_facet_reranker * len(self.reranker_CAN_NUM)
                     + i,
                 )
                 projected_emb_arr.append(projected_emb)
@@ -270,38 +224,10 @@ class GDAREIM(SequentialRecommender):
                     stacked_hidden_emb_arr_raw,
                     self.n_facet
                     + self.n_facet_context
-                    + self.n_facet_reranker * len(self.reranker_CAN_NUM)
                     + i,
                 )
                 projected_emb_arr.append(projected_emb)
 
-            for i in range(self.n_facet_reranker):
-                bsz, seq_len, hidden_size = projected_emb_arr[i].size()
-                for j in range(len(self.reranker_CAN_NUM)):
-                    if self.candidates_from_previous_reranker:
-                        _, candidate_token_ids = torch.topk(
-                            facet_lm_logits_arr[i], self.reranker_CAN_NUM[j]
-                        )
-                    else:
-                        candidate_token_ids = rereanker_candidate_token_ids_arr[i][j]
-                    logit_hidden_reranker_topn = (
-                        projected_emb_arr[
-                            self.n_facet + i * len(self.reranker_CAN_NUM) + j
-                        ]
-                        .unsqueeze(dim=2)
-                        .expand(bsz, seq_len, self.reranker_CAN_NUM[j], hidden_size)
-                        * self.item_embedding.weight[candidate_token_ids, :]
-                    ).sum(
-                        dim=-1
-                    )
-                    if self.reranker_merging_mode == "add":
-                        facet_lm_logits_arr[i].scatter_add_(
-                            2, candidate_token_ids, logit_hidden_reranker_topn
-                        )
-                    else:
-                        facet_lm_logits_arr[i].scatter_(
-                            2, candidate_token_ids, logit_hidden_reranker_topn
-                        )
 
             for i in range(self.n_facet_context):
                 bsz, seq_len_1, hidden_size = projected_emb_arr[i].size()
@@ -309,7 +235,6 @@ class GDAREIM(SequentialRecommender):
                 logit_hidden_context = (
                     projected_emb_arr[
                         self.n_facet
-                        + self.n_facet_reranker * len(self.reranker_CAN_NUM)
                         + i
                     ]
                     .unsqueeze(dim=2)
@@ -342,20 +267,6 @@ class GDAREIM(SequentialRecommender):
                         src=torch.ones_like(item_seq_expand).to(dtype=item_count.dtype),
                     )
                     only_new_logits = only_new_logits / item_count
-                else:
-                    only_new_logits.scatter_add_(
-                        dim=2, index=item_seq_expand, src=logit_hidden_context
-                    )
-                    item_count = torch.zeros_like(only_new_logits) + 1e-15
-                    item_count.scatter_add_(
-                        dim=2,
-                        index=item_seq_expand,
-                        src=torch.ones_like(item_seq_expand).to(dtype=item_count.dtype),
-                    )
-                    only_new_logits = only_new_logits / item_count
-                    only_new_logits.scatter_add_(
-                        dim=2, index=item_seq_expand, src=logit_hidden_pointer
-                    )
 
 
                 if self.partition_merging_mode == "replace":
@@ -368,19 +279,8 @@ class GDAREIM(SequentialRecommender):
                     )
                 facet_lm_logits_arr[i] = facet_lm_logits_arr[i] + only_new_logits
 
-
+            # ipdb.set_trace()
             weight = None
-            if self.weight_mode == "dynamic":
-                weight = self.weight_facet_decoder(stacked_hidden_emb_arr).softmax(
-                    dim=-1
-                )
-            elif self.weight_mode == "static":
-                weight = self.weight_global.softmax(
-                    dim=-1
-                )
-            elif self.weight_mode == "max_logits":
-                stacked_facet_lm_logits = torch.stack(facet_lm_logits_arr, dim=0)
-                facet_lm_logits_arr = [stacked_facet_lm_logits.amax(dim=0)]
 
             prediction_prob = 0
             copy_loss = 0
